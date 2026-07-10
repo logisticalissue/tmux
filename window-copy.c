@@ -2902,20 +2902,20 @@ window_copy_cmd_search_backward_incremental(struct window_copy_cmd_state *cs)
 	case '=':
 	case '-':
 		data->searchtype = WINDOW_COPY_SEARCHUP;
-		data->searchregex = 0;
+		data->searchregex = 1;
 		free(data->searchstr);
 		data->searchstr = xstrdup(arg0);
-		if (!window_copy_search_up(wme, 0)) {
+		if (!window_copy_search_up(wme, 1)) {
 			window_copy_clear_marks(wme);
 			return (WINDOW_COPY_CMD_REDRAW);
 		}
 		break;
 	case '+':
 		data->searchtype = WINDOW_COPY_SEARCHDOWN;
-		data->searchregex = 0;
+		data->searchregex = 1;
 		free(data->searchstr);
 		data->searchstr = xstrdup(arg0);
-		if (!window_copy_search_down(wme, 0)) {
+		if (!window_copy_search_down(wme, 1)) {
 			window_copy_clear_marks(wme);
 			return (WINDOW_COPY_CMD_REDRAW);
 		}
@@ -2959,20 +2959,20 @@ window_copy_cmd_search_forward_incremental(struct window_copy_cmd_state *cs)
 	case '=':
 	case '+':
 		data->searchtype = WINDOW_COPY_SEARCHDOWN;
-		data->searchregex = 0;
+		data->searchregex = 1;
 		free(data->searchstr);
 		data->searchstr = xstrdup(arg0);
-		if (!window_copy_search_down(wme, 0)) {
+		if (!window_copy_search_down(wme, 1)) {
 			window_copy_clear_marks(wme);
 			return (WINDOW_COPY_CMD_REDRAW);
 		}
 		break;
 	case '-':
 		data->searchtype = WINDOW_COPY_SEARCHUP;
-		data->searchregex = 0;
+		data->searchregex = 1;
 		free(data->searchstr);
 		data->searchstr = xstrdup(arg0);
-		if (!window_copy_search_up(wme, 0)) {
+		if (!window_copy_search_up(wme, 1)) {
 			window_copy_clear_marks(wme);
 			return (WINDOW_COPY_CMD_REDRAW);
 		}
