@@ -411,6 +411,16 @@ sort_would_window_tree_swap(struct sort_criteria *sort_crit,
 	return (sort_winlink_cmp(&wla, &wlb) != 0);
 }
 
+int
+sort_would_pane_swap(struct sort_criteria *sort_crit, struct window_pane *wpa,
+    struct window_pane *wpb)
+{
+	if (sort_crit->order == SORT_INDEX)
+		return (0);
+	sort_criteria = sort_crit;
+	return (sort_pane_cmp(&wpa, &wpb) != 0);
+}
+
 struct paste_buffer **
 sort_get_buffers(u_int *n, struct sort_criteria *sort_crit)
 {

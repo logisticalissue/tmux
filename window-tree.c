@@ -71,6 +71,7 @@ static const struct menu_item window_tree_menu_items[] = {
 	{ "Tag All", '\024', NULL },
 	{ "Tag None", 'T', NULL },
 	{ "", KEYC_NONE, NULL },
+	{ "Break Pane", 'b', NULL },
 	{ "Kill", 'x', NULL },
 	{ "Kill Tagged", 'X', NULL },
 	{ "", KEYC_NONE, NULL },
@@ -102,6 +103,7 @@ struct window_tree_itemdata {
 	int			session;
 	int			winlink;
 	int			pane;
+	int			mode_host;
 };
 
 struct window_tree_modedata {
@@ -287,6 +289,7 @@ window_tree_build_pane(struct session *s, struct winlink *wl,
 	item->session = s->id;
 	item->winlink = wl->idx;
 	item->pane = wp->id;
+	item->mode_host = (wp == data->wp);
 
 	ft = format_create(NULL, NULL, FORMAT_PANE|wp->id, 0);
 	format_defaults(ft, NULL, s, wl, wp);
@@ -1000,35 +1003,33 @@ window_tree_get_key(void *modedata, void *itemdata, u_int line)
 	return (key);
 }
 
-static int
-window_tree_swap(void *cur_itemdata, void *other_itemdata,
-    struct sort_criteria *sort_crit)
+static enum mode_tree_swap_result
+window_tree_swap_window(struct window_tree_itemdata *cur,
+    struct window_tree_itemdata *other, struct sort_criteria *sort_crit)
 {
-	struct window_tree_itemdata	*cur = cur_itemdata;
-	struct window_tree_itemdata	*other = other_itemdata;
 	struct session			*cur_session, *other_session;
 	struct winlink			*cur_winlink, *other_winlink;
 	struct window			*cur_window, *other_window;
 	struct window_pane		*cur_pane, *other_pane;
 
-	if (cur->type != other->type)
-		return (0);
-	if (cur->type != WINDOW_TREE_WINDOW)
-		return (0);
+	if (other == NULL || other->type != WINDOW_TREE_WINDOW)
+		return (MODE_TREE_SWAP_NONE);
 
 	window_tree_pull_item(cur, &cur_session, &cur_winlink, &cur_pane);
 	window_tree_pull_item(other, &other_session, &other_winlink,
 	    &other_pane);
 
+	if (cur_session == NULL || other_session == NULL)
+		return (MODE_TREE_SWAP_NONE);
 	if (cur_session != other_session)
-		return (0);
+		return (MODE_TREE_SWAP_NONE);
 
 	/*
 	 * Swapping indexes would not swap positions in the tree, so prevent
 	 * swapping to avoid confusing the user.
 	 */
 	if (sort_would_window_tree_swap(sort_crit, cur_winlink, other_winlink))
-		return (0);
+		return (MODE_TREE_SWAP_NONE);
 
 	other_window = other_winlink->window;
 	TAILQ_REMOVE(&other_window->winlinks, other_winlink, wentry);
@@ -1048,7 +1049,236 @@ window_tree_swap(void *cur_itemdata, void *other_itemdata,
 	server_redraw_session_group(cur_session);
 	recalculate_sizes();
 
-	return (1);
+	return (MODE_TREE_SWAP_SIBLING);
+}
+
+/* Swap the positions of two panes within the same window. */
+static void
+window_tree_swap_two_panes(struct window_pane *src_wp,
+    struct window_pane *dst_wp)
+{
+	struct window		*w = src_wp->window;
+	struct window_pane	*tmp_wp;
+	struct layout_cell	*src_lc, *dst_lc;
+	u_int			 sx, sy, xoff, yoff;
+
+	window_push_zoom(w, 0, 1);
+
+	server_client_remove_pane(src_wp);
+	server_client_remove_pane(dst_wp);
+
+	tmp_wp = TAILQ_PREV(dst_wp, window_panes, entry);
+	TAILQ_REMOVE(&w->panes, dst_wp, entry);
+	TAILQ_REPLACE(&w->panes, src_wp, dst_wp, entry);
+	if (tmp_wp == src_wp)
+		tmp_wp = dst_wp;
+	if (tmp_wp == NULL)
+		TAILQ_INSERT_HEAD(&w->panes, src_wp, entry);
+	else
+		TAILQ_INSERT_AFTER(&w->panes, tmp_wp, src_wp, entry);
+
+	tmp_wp = TAILQ_PREV(dst_wp, window_panes, zentry);
+	TAILQ_REMOVE(&w->z_index, dst_wp, zentry);
+	TAILQ_REPLACE(&w->z_index, src_wp, dst_wp, zentry);
+	if (tmp_wp == src_wp)
+		tmp_wp = dst_wp;
+	if (tmp_wp == NULL)
+		TAILQ_INSERT_HEAD(&w->z_index, src_wp, zentry);
+	else
+		TAILQ_INSERT_AFTER(&w->z_index, tmp_wp, src_wp, zentry);
+
+	src_lc = src_wp->layout_cell;
+	dst_lc = dst_wp->layout_cell;
+	src_lc->wp = dst_wp;
+	dst_wp->layout_cell = src_lc;
+	dst_lc->wp = src_wp;
+	src_wp->layout_cell = dst_lc;
+
+	sx = src_wp->sx; sy = src_wp->sy;
+	xoff = src_wp->xoff; yoff = src_wp->yoff;
+	src_wp->xoff = dst_wp->xoff; src_wp->yoff = dst_wp->yoff;
+	window_pane_resize(src_wp, dst_wp->sx, dst_wp->sy);
+	dst_wp->xoff = xoff; dst_wp->yoff = yoff;
+	window_pane_resize(dst_wp, sx, sy);
+
+	layout_fix_panes(w, NULL);
+	window_pop_zoom(w);
+	redraw_invalidate_scene(w);
+	server_redraw_window(w);
+	events_fire_window("window-layout-changed", w);
+}
+
+/* Move a pane out of its window and into another (like join-pane). */
+static enum mode_tree_swap_result
+window_tree_move_pane(struct session *s, struct winlink *src_wl,
+    struct window_pane *src_wp, struct winlink *dst_wl,
+    struct window_pane *dst_wp, int before, int follow)
+{
+	struct window		*src_w = src_wl->window;
+	struct window		*dst_w = dst_wl->window;
+	struct layout_cell	*lc;
+
+	if (dst_w == src_w)
+		return (MODE_TREE_SWAP_NONE);
+	if (src_wp == src_w->modal || dst_wp == dst_w->modal)
+		return (MODE_TREE_SWAP_NONE);
+
+	/*
+	 * Preserve any zoom (for example the zoomed tree pane itself) across the
+	 * layout change rather than dropping it, so the view does not jump.
+	 */
+	window_push_zoom(dst_w, 0, 1);
+	window_push_zoom(src_w, 0, 1);
+
+	lc = layout_split_pane(dst_wp, LAYOUT_TOPBOTTOM, -1,
+	    before ? SPAWN_BEFORE : 0);
+	if (lc == NULL) {
+		window_pop_zoom(src_w);
+		window_pop_zoom(dst_w);
+		return (MODE_TREE_SWAP_NONE);
+	}
+
+	layout_close_pane(src_wp);
+	server_client_remove_pane(src_wp);
+	window_lost_pane(src_w, src_wp);
+	TAILQ_REMOVE(&src_w->panes, src_wp, entry);
+	TAILQ_REMOVE(&src_w->z_index, src_wp, zentry);
+
+	src_wp->window = dst_w;
+	options_set_parent(src_wp->options, dst_w->options);
+	src_wp->flags |= (PANE_STYLECHANGED|PANE_THEMECHANGED);
+	if (before) {
+		TAILQ_INSERT_BEFORE(dst_wp, src_wp, entry);
+		TAILQ_INSERT_BEFORE(dst_wp, src_wp, zentry);
+	} else {
+		TAILQ_INSERT_AFTER(&dst_w->panes, dst_wp, src_wp, entry);
+		TAILQ_INSERT_AFTER(&dst_w->z_index, dst_wp, src_wp, zentry);
+	}
+	layout_assign_pane(lc, src_wp, 0);
+	colour_palette_from_option(&src_wp->palette, src_wp->options);
+
+	recalculate_sizes();
+
+	window_set_active_pane(dst_w, src_wp, 1);
+	if (follow && s->curw == src_wl) {
+		session_set_current(s, dst_wl);
+		session_group_synchronize_from(s);
+		server_redraw_session_group(s);
+	}
+
+	window_fire_pane_moved(src_wp, src_w, src_wl->idx, dst_w, dst_wl->idx);
+	if (window_count_panes(src_w, 1) == 0)
+		server_kill_window(src_w, 1);
+	else {
+		window_pop_zoom(src_w);
+		server_redraw_window(src_w);
+		events_fire_window("window-layout-changed", src_w);
+	}
+	window_pop_zoom(dst_w);
+	server_redraw_window(dst_w);
+	events_fire_window("window-layout-changed", dst_w);
+
+	return (MODE_TREE_SWAP_MOVED);
+}
+
+static enum mode_tree_swap_result
+window_tree_swap_pane(struct window_tree_itemdata *cur,
+    struct window_tree_itemdata *other, int direction,
+    struct sort_criteria *sort_crit)
+{
+	struct session			*cur_session, *other_session;
+	struct winlink			*cur_winlink, *other_winlink, **l;
+	struct winlink			*dst_wl = NULL;
+	struct window			*dst_w;
+	struct window_pane		*cur_pane, *other_pane, *dst_wp;
+	u_int				 n, i;
+	int				 before;
+
+	window_tree_pull_item(cur, &cur_session, &cur_winlink, &cur_pane);
+	if (cur_session == NULL || cur_winlink == NULL || cur_pane == NULL)
+		return (MODE_TREE_SWAP_NONE);
+	if (window_pane_is_floating(cur_pane))
+		return (MODE_TREE_SWAP_NONE);
+
+	/*
+	 * If there is a sibling pane in the same window in this direction, swap
+	 * the two panes. Otherwise the edge of the window has been reached, so
+	 * move the pane into the previous or next window of the session.
+	 */
+	if (other != NULL && other->type == WINDOW_TREE_PANE) {
+		window_tree_pull_item(other, &other_session, &other_winlink,
+		    &other_pane);
+		if (other_pane == NULL || other_winlink != cur_winlink)
+			return (MODE_TREE_SWAP_NONE);
+		if (window_pane_is_floating(other_pane))
+			return (MODE_TREE_SWAP_NONE);
+		if (sort_would_pane_swap(sort_crit, cur_pane, other_pane))
+			return (MODE_TREE_SWAP_NONE);
+		window_tree_swap_two_panes(cur_pane, other_pane);
+		return (MODE_TREE_SWAP_MOVED);
+	}
+
+	/* Find the adjacent window in the displayed (sorted) order. */
+	l = sort_get_winlinks_session(cur_session, &n, sort_crit);
+	for (i = 0; i < n; i++) {
+		if (l[i] == cur_winlink)
+			break;
+	}
+	if (i == n)
+		return (MODE_TREE_SWAP_NONE);
+	if (direction < 0) {
+		if (i == 0)
+			return (MODE_TREE_SWAP_NONE);
+		dst_wl = l[i - 1];
+	} else {
+		if (i + 1 >= n)
+			return (MODE_TREE_SWAP_NONE);
+		dst_wl = l[i + 1];
+	}
+	dst_w = dst_wl->window;
+
+	/*
+	 * Moving up drops the pane in at the bottom of the previous window;
+	 * moving down drops it in at the top of the next window.
+	 */
+	if (direction < 0) {
+		for (dst_wp = TAILQ_LAST(&dst_w->panes, window_panes);
+		    dst_wp != NULL;
+		    dst_wp = TAILQ_PREV(dst_wp, window_panes, entry)) {
+			if (layout_cell_is_tiled(dst_wp->layout_cell))
+				break;
+		}
+		before = 0;
+	} else {
+		for (dst_wp = TAILQ_FIRST(&dst_w->panes); dst_wp != NULL;
+		    dst_wp = TAILQ_NEXT(dst_wp, entry)) {
+			if (layout_cell_is_tiled(dst_wp->layout_cell))
+				break;
+		}
+		before = 1;
+	}
+	if (dst_wp == NULL)
+		return (MODE_TREE_SWAP_NONE);
+
+	return (window_tree_move_pane(cur_session, cur_winlink, cur_pane, dst_wl,
+	    dst_wp, before, cur->mode_host));
+}
+
+static enum mode_tree_swap_result
+window_tree_swap(void *cur_itemdata, void *other_itemdata, int direction,
+    struct sort_criteria *sort_crit)
+{
+	struct window_tree_itemdata	*cur = cur_itemdata;
+	struct window_tree_itemdata	*other = other_itemdata;
+
+	switch (cur->type) {
+	case WINDOW_TREE_WINDOW:
+		return (window_tree_swap_window(cur, other, sort_crit));
+	case WINDOW_TREE_PANE:
+		return (window_tree_swap_pane(cur, other, direction, sort_crit));
+	default:
+		return (MODE_TREE_SWAP_NONE);
+	}
 }
 
 static void
@@ -1063,9 +1293,11 @@ static const char* window_tree_help_lines[] = {
 	"#[fg=themelightgrey]"
 	"      Enter #[#{E:tree-mode-border-style},acs]x#[default] Choose selected item",
 	"#[fg=themelightgrey]"
-	"       S-Up #[#{E:tree-mode-border-style},acs]x#[default] Swap current and previous window",
+	"       S-Up #[#{E:tree-mode-border-style},acs]x#[default] Swap window up, or move pane to previous window",
 	"#[fg=themelightgrey]"
-	"     S-Down #[#{E:tree-mode-border-style},acs]x#[default] Swap current and next window",
+	"     S-Down #[#{E:tree-mode-border-style},acs]x#[default] Swap window down, or move pane to next window",
+	"#[fg=themelightgrey]"
+	"          b #[#{E:tree-mode-border-style},acs]x#[default] Break pane into a new window",
 	"#[fg=themelightgrey]"
 	"          x #[#{E:tree-mode-border-style},acs]x#[default] Kill selected item",
 	"#[fg=themelightgrey]"
@@ -1092,7 +1324,7 @@ static const char* window_tree_help_lines[] = {
 static const char**
 window_tree_help(u_int *width, const char **item)
 {
-	*width = 51;
+	*width = 63;
 	*item = "item";
 	return (window_tree_help_lines);
 }
@@ -1368,6 +1600,62 @@ window_tree_kill_tagged_callback(struct client *c, void *modedata,
 	return (PROMPT_CLOSE);
 }
 
+/* Break a pane off into a new window at the end of its session. */
+static int
+window_tree_break_pane(struct session *s, struct winlink *wl,
+    struct window_pane *wp, int follow)
+{
+	struct window	*w = wl->window, *old_w = w, *neww;
+	struct winlink	*neww_wl;
+	char		*cause = NULL;
+	int		 old_idx = wl->idx, idx;
+
+	if (wp == w->modal || window_pane_is_floating(wp))
+		return (0);
+	if (window_count_panes(w, 1) == 1)
+		return (0);	/* already alone in its own window */
+
+	window_push_zoom(w, 0, 1);
+
+	TAILQ_REMOVE(&w->panes, wp, entry);
+	TAILQ_REMOVE(&w->z_index, wp, zentry);
+	server_client_remove_pane(wp);
+	window_lost_pane(w, wp);
+	layout_close_pane(wp);
+
+	neww = wp->window = window_create(w->sx, w->sy, w->xpixel, w->ypixel);
+	window_add_ref(neww, __func__);
+	options_set_parent(wp->options, neww->options);
+	wp->flags |= (PANE_STYLECHANGED|PANE_THEMECHANGED);
+	TAILQ_INSERT_HEAD(&neww->panes, wp, entry);
+	TAILQ_INSERT_HEAD(&neww->z_index, wp, zentry);
+	neww->active = wp;
+
+	free(neww->name);
+	neww->name = default_window_name(neww);
+
+	layout_init(neww, wp);
+	wp->flags |= PANE_CHANGED;
+	colour_palette_from_option(&wp->palette, wp->options);
+
+	idx = -1 - options_get_number(s->options, "base-index");
+	neww_wl = session_attach(s, neww, idx, &cause); /* can't fail */
+	window_remove_ref(neww, __func__);
+	events_fire_window("window-created", neww);
+	window_fire_pane_moved(wp, old_w, old_idx, neww, neww_wl->idx);
+	if (follow && s->curw == wl) {
+		session_set_current(s, neww_wl);
+		session_group_synchronize_from(s);
+	}
+
+	window_pop_zoom(old_w);
+	server_redraw_session(s);
+	server_status_session_group(s);
+	recalculate_sizes();
+
+	return (1);
+}
+
 static key_code
 window_tree_mouse(struct window_tree_modedata *data, key_code key, u_int x,
     struct window_tree_itemdata *item)
@@ -1479,6 +1767,24 @@ again:
 	case 'M':
 		server_clear_marked();
 		mode_tree_build(data->data);
+		break;
+	case 'b':
+		if (item->type != WINDOW_TREE_PANE)
+			break;
+		window_tree_pull_item(item, &ns, &nwl, &nwp);
+		if (ns == NULL || nwl == NULL || nwp == NULL)
+			break;
+		if (window_tree_break_pane(ns, nwl, nwp,
+		    nwp == data->wp)) {
+			mode_tree_build(data->data);
+			/* Follow the pane to its new window. */
+			nwl = winlink_find_by_window(&ns->windows, nwp->window);
+			if (nwl != NULL) {
+				mode_tree_expand(data->data, (uint64_t)ns);
+				mode_tree_expand(data->data, (uint64_t)nwl);
+				mode_tree_set_current(data->data, (uint64_t)nwp);
+			}
+		}
 		break;
 	case 'i':
 		data->preview_is_info = !data->preview_is_info;

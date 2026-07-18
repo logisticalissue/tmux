@@ -2617,6 +2617,8 @@ enum sort_order		  sort_order_from_string(const char *);
 const char		 *sort_order_to_string(enum sort_order);
 int			  sort_would_window_tree_swap(struct sort_criteria *,
 			      struct winlink *, struct winlink *);
+int			  sort_would_pane_swap(struct sort_criteria *,
+			      struct window_pane *, struct window_pane *);
 struct paste_buffer	**sort_get_buffers(u_int *, struct sort_criteria *);
 struct client		**sort_get_clients(u_int *, struct sort_criteria *);
 struct session		**sort_get_sessions(u_int *, struct sort_criteria *);
@@ -3882,7 +3884,13 @@ typedef int (*mode_tree_search_cb)(void *, void *, const char *, int);
 typedef void (*mode_tree_menu_cb)(void *, struct client *, key_code);
 typedef u_int (*mode_tree_height_cb)(void *, u_int);
 typedef key_code (*mode_tree_key_cb)(void *, void *, u_int);
-typedef int (*mode_tree_swap_cb)(void *, void *, struct sort_criteria *);
+enum mode_tree_swap_result {
+	MODE_TREE_SWAP_NONE,
+	MODE_TREE_SWAP_SIBLING,
+	MODE_TREE_SWAP_MOVED
+};
+typedef enum mode_tree_swap_result (*mode_tree_swap_cb)(void *, void *, int,
+						    struct sort_criteria *);
 typedef void (*mode_tree_sort_cb)(struct sort_criteria *);
 typedef void (*mode_tree_each_cb)(void *, void *, struct client *, key_code);
 typedef const char** (*mode_tree_help_cb)(u_int *, const char**);

@@ -400,29 +400,75 @@ mode_tree_down(struct mode_tree_data *mtd, int wrap)
 static void
 mode_tree_swap(struct mode_tree_data *mtd, int direction)
 {
-	u_int	current_depth = mtd->line_list[mtd->current].depth;
-	u_int	swap_with, swap_with_depth;
+	struct mode_tree_item	*cur, *mti, *parent;
+	uint64_t		 cur_tag;
+	u_int			 current_depth, swap_with = 0, swap_with_depth;
+	void			*other = NULL;
+	int			 expanded;
+	enum mode_tree_swap_result result;
 
-	if (mtd->swapcb == NULL)
+	if (mtd->swapcb == NULL || mtd->line_size == 0)
 		return;
 
-	/* Find the next line at the same depth with the same parent . */
+	cur = mtd->line_list[mtd->current].item;
+	cur_tag = cur->tag;
+	current_depth = mtd->line_list[mtd->current].depth;
+
+	/*
+	 * Find the next line at the same depth (a sibling). Deeper lines are
+	 * children of the current item and are skipped; a shallower line means
+	 * the edge of the current group has been reached and there is no
+	 * sibling in this direction.
+	 */
 	swap_with = mtd->current;
-	do {
+	for (;;) {
 		if (direction < 0 && swap_with < (u_int)-direction)
-			return;
+			break;
 		if (direction > 0 && swap_with + direction >= mtd->line_size)
-			return;
+			break;
 		swap_with += direction;
 		swap_with_depth = mtd->line_list[swap_with].depth;
-	} while (swap_with_depth > current_depth);
-	if (swap_with_depth != current_depth)
-		return;
+		if (swap_with_depth < current_depth)
+			break;
+		if (swap_with_depth == current_depth) {
+			other = mtd->line_list[swap_with].item->itemdata;
+			break;
+		}
+	}
 
-	if (mtd->swapcb(mtd->line_list[mtd->current].item->itemdata,
-	    mtd->line_list[swap_with].item->itemdata, &mtd->sort_crit)) {
+	/*
+	 * If the item was swapped with its sibling, follow it to the sibling's
+	 * slot. If it was moved elsewhere, follow it by its stable tag.
+	 */
+	result = mtd->swapcb(cur->itemdata, other, direction, &mtd->sort_crit);
+	if (result == MODE_TREE_SWAP_SIBLING && other != NULL) {
 		mtd->current = swap_with;
 		mode_tree_build(mtd);
+	} else if (result == MODE_TREE_SWAP_MOVED) {
+		mode_tree_build(mtd);
+
+		/*
+		 * The item was moved elsewhere in the tree (for example a pane
+		 * moved into another window). Its new parent may be collapsed,
+		 * in which case the item has no visible line to select and the
+		 * cursor would be stranded on the old position. Expand its
+		 * ancestors so it can be followed by its stable tag.
+		 */
+		mti = mode_tree_find_item(&mtd->children, cur_tag);
+		if (mti != NULL) {
+			expanded = 0;
+			for (parent = mti->parent; parent != NULL;
+			    parent = parent->parent) {
+				if (!parent->expanded) {
+					parent->expanded = 1;
+					expanded = 1;
+				}
+			}
+			if (expanded)
+				mode_tree_build(mtd);
+		}
+
+		mode_tree_set_current(mtd, cur_tag);
 	}
 }
 
